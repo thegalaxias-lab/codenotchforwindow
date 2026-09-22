@@ -1,0 +1,81 @@
+#!/bin/bash
+# glm-key-setup — Z.ai GLM Coding Plan API 키를 codenotch가 읽는 위치에 저장하고
+# z.ai에 시험 조회까지 해서 확인해줍니다. 키는 프롬프트로 입력받으므로
+# 셸 히스토리에 남지 않습니다.
+set -u
+
+AUTH_FILE="$HOME/.local/share/opencode/auth.json"
+KEY_URL="https://z.ai/manage-apikey/apikey-list"
+
+echo "── Z.ai GLM Coding Plan 키 설정 ──"
+echo "키가 아직 없다면 이 페이지에서 발급하세요: $KEY_URL"
+echo
+
+while :; do
+    printf 'API 키를 붙여넣고 엔터 (취소: q): '
+    IFS= read -r KEY
+    # 붙여넣을 때 따옴표나 공백이 섞여 들어와도 동작하도록 정리
+    KEY="${KEY//\"/}"; KEY="${KEY//\'/}"; KEY="${KEY// /}"
+    if [ "$KEY" = "q" ]; then echo "취소했습니다."; exit 0; fi
+    [ -n "$KEY" ] && break
+    echo "키가 비어 있습니다. 다시 붙여넣어 주세요."
+done
+
+echo
+echo "z.ai에 이 키로 사용량 조회를 시험하는 중…"
+CHECK_JSON="$(mktemp)"
+# 이 엔드포인트는 실패도 HTTP 200 안에 {"code":401,"success":false}로 돌려주므로
+# 상태코드만으로 판단하지 않고 본문의 success 필드를 본다.
+STATUS="$(curl -s -o "$CHECK_JSON" -w '%{http_code}' -m 20 \
+    -H "Authorization: $KEY" -H "Content-Type: application/json" \
+    "https://api.z.ai/api/monitor/usage/quota/limit" || echo 000)"
+VERDICT="$(python3 - "$CHECK_JSON" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("BAD"); raise SystemExit
+print("OK" if d.get("success") is True else "REJECTED")
+PY
+)"
+
+if [ "$VERDICT" != "OK" ]; then
+    echo "경고: z.ai가 이 키를 거부했습니다 (HTTP $STATUS)."
+    echo "  - 코딩 플랜이 연결된 키인지 ($KEY_URL 에서 확인)"
+    echo "  - 키를 새로 복사했는지 (만료/오타) 확인해 보세요."
+    printf "그래도 저장하시겠습니까? (y = 저장, 그 외 = 취소): "
+    IFS= read -r ANSWER
+    [ "$ANSWER" = "y" ] || { echo "저장하지 않고 끝냈습니다."; rm -f "$CHECK_JSON"; exit 1; }
+fi
+
+mkdir -p "$(dirname "$AUTH_FILE")"
+printf '{"zai-coding-plan": {"type": "api", "key": "%s"}}\n' "$KEY" > "$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+
+echo
+if [ "$VERDICT" = "OK" ]; then
+    echo "완료! 키 저장 + 사용량 조회 모두 성공했습니다."
+    python3 - "$CHECK_JSON" <<'PY'
+import json, sys, datetime
+try:
+    d = json.load(open(sys.argv[1])).get("data") or {}
+    if d.get("level"):
+        print("플랜:", d["level"])
+    for lim in (d.get("limits") or []):
+        pct = lim.get("percentage")
+        reset = lim.get("nextResetTime")
+        when = datetime.datetime.fromtimestamp(reset/1000).strftime("%m/%d %H:%M") if reset else "-"
+        kind = {"TOKENS_LIMIT":"토큰","CREDIT_LIMIT":"크레딧","TIME_LIMIT":"MCP 호출"}.get(lim.get("type"), lim.get("type"))
+        unit, number = lim.get("unit"), lim.get("number")
+        span = f"({number}{'주' if unit==6 else '시간'})" if unit in (3,6) and number else ""
+        if pct is not None:
+            print(f"  {kind} {span}: {pct}% 사용 · 리셋 {when}")
+except Exception as e:
+    print("(요약 출력 생략:", e, ")")
+PY
+else
+    echo "저장했습니다(조회는 여전히 실패 상태)."
+fi
+rm -f "$CHECK_JSON"
+echo "저장 위치: $AUTH_FILE"
+echo "노치의 GLM 항목은 다음 자동 갱신 때 숫자가 뜹니다(앱 재시작 불필요)."
